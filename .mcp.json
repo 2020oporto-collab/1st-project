@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "opgg-mcp": {
+      "type": "http",
+      "url": "https://mcp-api.op.gg/mcp"
+    }
+  }
+}
