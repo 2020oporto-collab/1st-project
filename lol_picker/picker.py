@@ -26,6 +26,9 @@ SYNERGY_WEIGHT = 0.5
 K_MY_CHAMP = 20
 MIN_RECENT_GAMES = 2  # 시즌 상위 챔피언이 아니면 최근 20판에서 이 이상 해야 챔피언풀로 본다
 MY_CHAMP_WEIGHT = 0.5
+# LoLalytics 상대 라인별 전적 (전체 목록이라 선택 편향 없음)
+K_LOLA = 300
+CROSS_LANE_WEIGHT = 0.7  # 다른 라인 효과는 서로 겹치는 부분이 있어 줄여서 더한다
 HEURISTIC_STEP = 0.04  # 로그오즈 0.04 ≈ 승률 1%p
 MIN_META_PLAY = 1000   # 이보다 적게 플레이된 챔피언은 메타 후보에서 뺀다
 STALE_DAYS = 7
@@ -65,6 +68,7 @@ class Picker:
         self.analysis = cache.get("analysis", {})
         self.meta = cache.get("meta", {})
         self.profile = cache.get("profile") or {}
+        self.lola = cache.get("lolalytics", {})  # load_cache()가 lolalytics.json을 합쳐 넣는다
 
         # 이름 → 정규화된 영문 이름(nk). 모든 데이터는 nk로 찾는다.
         self.alias = {}
@@ -74,6 +78,8 @@ class Picker:
             self.by_nk[nk] = c
             for name in (c["en"], c["ko"], c["key"]):
                 self.alias.setdefault(norm(name), nk)
+        self.nk_by_id = {int(c["id"]): norm(c["en"]) for c in self.champs.values()}
+        self._lola_index = {}
         self.base = {
             p: {norm(e["champion"]): (e["win"], e["play"]) for e in self.meta.get(p, [])}
             for p in POSITIONS
@@ -140,6 +146,39 @@ class Picker:
                     return x["win"], x["play"]
         return None
 
+    @staticmethod
+    def _lola_expected(my_wr, all_wr):
+        """상대 강도만으로 본 기대 승률. all_wr = 100 - 상대 승률(%)."""
+        return sigmoid(logit(my_wr) + logit(all_wr / 100))
+
+    def lola_record(self, pos, me, vpos, enemy):
+        """LoLalytics: 내(pos) vs 상대(vpos) 전적 → (내 승률, 판수, 기대 승률, 중심화 보정값).
+
+        LoLalytics는 챔피언 평균 승률이 50%가 아니라(약 51.8%) 기대값과의 차이가 전부 +쪽으로
+        치우친다. 그래서 상대 목록 전체의 판수 가중 평균 차이를 0으로 맞추는 보정값(offset)을 함께 준다.
+        """
+        item = self.lola.get(pos, {}).get(me)
+        if not item or vpos not in item.get("vs", {}):
+            return None
+        key = (pos, me, vpos)
+        if key not in self._lola_index:
+            rows = item["vs"][vpos]
+            my_wr = item["wr"] / 100
+            total = sum(r[2] for r in rows)
+            offset = sum(r[2] * (logit(r[1] / 100) - logit(self._lola_expected(my_wr, r[3])))
+                         for r in rows) / total if total else 0.0
+            self._lola_index[key] = ({self.nk_by_id.get(r[0]): r for r in rows}, offset)
+        index, offset = self._lola_index[key]
+        r = index.get(enemy)
+        if not r:
+            return None
+        _, vs_wr, n, all_wr = r
+        expected = sigmoid(logit(self._lola_expected(item["wr"] / 100, all_wr)) + offset)
+        return vs_wr / 100, n, expected
+
+    def has_lola(self, pos, me):
+        return bool(self.lola.get(pos, {}).get(me, {}).get("vs"))
+
     def damage_type(self, nk, pos=None):
         for p in ([pos] if pos else []) + POSITIONS:
             a = self._an(p, nk) if p else None
@@ -203,9 +242,30 @@ class Picker:
             x += delta
             factors.append((label, delta, kind, detail))
 
-        # 1) 맞라인 상성
+        # 1) 상대 픽과의 상성 (LoLalytics: 모든 라인 / 없으면 OP.GG: 같은 라인만)
+        lola_ok = self.has_lola(pos, cand)
+        for vpos, enemy in enemies.items():
+            rec = self.lola_record(pos, cand, vpos, enemy) if lola_ok else None
+            if not rec:
+                continue
+            vs_wr, n, expected = rec
+            p = shrink(vs_wr * n, n, expected, K_LOLA)
+            inter = logit(p) - logit(expected)
+            if vpos == pos:
+                owr, _ = self.base_wr(pos, enemy)
+                strength = -logit(owr) if owr else 0.0
+                add(f"맞라인 vs {self.display(enemy)}", strength + inter, "통계",
+                    f"LoLalytics {n:,}판 실제 {vs_wr:.1%} / 기대 {expected:.1%}")
+            else:
+                add(f"상대 {POSITION_KO[vpos]} {self.display(enemy)}", CROSS_LANE_WEIGHT * inter, "통계",
+                    f"LoLalytics {n:,}판 실제 {vs_wr:.1%} / 기대 {expected:.1%}")
+        if lola_ok:
+            missing = [e for vp, e in enemies.items() if not self.lola_record(pos, cand, vp, e)]
+            if missing:
+                notes.append("LoLalytics 표본 없음: " + ", ".join(self.display(e) for e in missing))
+
         opp = enemies.get(pos)
-        if opp:
+        if opp and not (lola_ok and self.lola_record(pos, cand, pos, opp)):
             owr, _ = self.base_wr(pos, opp)
             expected = sigmoid(logit(bwr) - logit(owr)) if owr else bwr
             rec = self.matchup_record(pos, cand, opp)
@@ -246,7 +306,7 @@ class Picker:
                 add("팀 딜 밸런스", HEURISTIC_STEP if my_dt == "AD" else -HEURISTIC_STEP, "추정",
                     "아군에 AD 없음")
         enemy_tags = [self.primary_tag(e) for e in enemies.values()]
-        if my_tag == "Assassin":
+        if my_tag == "Assassin" and not lola_ok:  # 실제 교차 라인 통계가 있으면 이 추정은 생략
             n_tank = enemy_tags.count("Tank")
             n_squishy = sum(t in ("Mage", "Marksman", "Assassin") for t in enemy_tags)
             if n_tank >= 2:
@@ -311,7 +371,13 @@ def render(picker, pos, enemies, allies, pool_rank, meta_rank):
             for n in notes:
                 lines.append(f"     ! {n}")
     lines.append("")
-    lines.append("※ [추정]은 통계가 아니라 규칙 기반 보정입니다. 다른 라인 상대와의 상성은 OP.GG에 데이터가 없습니다.")
+    if picker.lola.get(pos):
+        meta = picker.cache.get("lolalytics_meta", {})
+        period = "최근 30일" if str(meta.get("patch")) == "30" else f"패치 {meta.get('patch')}"
+        lines.append(f"※ 상대 픽 상성: LoLalytics ({meta.get('tier', '')}, {period}) / 기본 승률·시너지: OP.GG")
+    else:
+        lines.append("※ 이 포지션은 LoLalytics 데이터가 없어 다른 라인 상대 상성이 빠져 있습니다.")
+    lines.append("※ [추정]은 통계가 아니라 규칙 기반 보정입니다.")
     return "\n".join(lines)
 
 
@@ -332,7 +398,14 @@ def load_cache(path):
     if not os.path.exists(path):
         raise PickerError(f"캐시 파일이 없습니다: {path}\n먼저 `python -m lol_picker.collect`를 실행하세요.")
     with open(path, encoding="utf-8") as f:
-        return json.load(f)
+        cache = json.load(f)
+    lola_path = os.path.join(os.path.dirname(path), "lolalytics.json")
+    if os.path.exists(lola_path):
+        with open(lola_path, encoding="utf-8") as f:
+            lola = json.load(f)
+        cache["lolalytics"] = lola.get("data", {})
+        cache["lolalytics_meta"] = lola.get("meta", {})
+    return cache
 
 
 def stale_warning(cache):

@@ -1,6 +1,9 @@
 import unittest
 
+import json
+
 from lol_picker.collect import api_name, norm
+from lol_picker.lolalytics import LolalyticsError, parse_counters, slug
 from lol_picker.opgg_client import parse_opgg_text
 from lol_picker.picker import Picker, PickerError, parse_picks
 
@@ -137,6 +140,74 @@ class PickerTest(unittest.TestCase):
                          {"top": "SINGED", "jungle": "WUKONG"})
         with self.assertRaises(PickerError):
             parse_picks(self.p, ["신지드"])
+
+
+def qwik_page(objs):
+    return f'<html><script type="qwik/json">{json.dumps({"objs": objs})}</script></html>'
+
+
+class LolalyticsTest(unittest.TestCase):
+    def test_parse_counters(self):
+        # 참조는 base36 인덱스: "a" = 10
+        objs = [
+            {"stats": "1", "counters": "4"},           # 0
+            {"cid": "2", "wr": "3", "counters": "4"},   # 1
+            90, "51.95",                                # 2, 3
+            ["5"],                                      # 4
+            {"cid": "6", "vsWr": "7", "n": "8", "d1": "9", "allWr": "a"},  # 5
+            2, 44.63, 177, -3.38, 48.01,                # 6..10
+        ]
+        stats, rows = parse_counters(qwik_page(objs))
+        self.assertEqual(stats["cid"], 90)
+        self.assertEqual(stats["wr"], "51.95")
+        self.assertEqual(rows, [[2, 44.63, 177, 48.01]])
+
+    def test_parse_fails_loudly(self):
+        with self.assertRaises(LolalyticsError):
+            parse_counters("<html>no data</html>")
+
+    def test_slug(self):
+        self.assertEqual(slug("Twisted Fate"), "twistedfate")
+        self.assertEqual(slug("Nunu & Willump"), "nunu")
+        self.assertEqual(slug("Kha'Zix"), "khazix")
+
+
+class LolalyticsScoreTest(unittest.TestCase):
+    def setUp(self):
+        cache = make_cache()
+        # 말자하(미드) vs 상대 탑 신지드: 1000판 40% (기대 ~50%) → 불리
+        cache["lolalytics"] = {"mid": {"MALZAHAR": {"wr": 50.0, "vs": {
+            # 목록 전체 평균 대비로 중심화되므로 비교 대상 행을 함께 둔다
+            "top": [[4, 40.0, 1000, 50.0], [8, 52.0, 3000, 50.0]],
+            "mid": [[2, 55.0, 2000, 49.0], [3, 47.0, 2000, 49.0]],
+        }}}}
+        cache["lolalytics_meta"] = {"tier": "emerald_plus", "patch": "30"}
+        self.p = Picker(cache)
+
+    def test_cross_lane_enemy_lowers_score(self):
+        base, _, _ = self.p.score("mid", "MALZAHAR", {}, {})
+        vs_singed, factors, _ = self.p.score("mid", "MALZAHAR", {"top": "SINGED"}, {})
+        self.assertLess(vs_singed, base - 0.03)
+        self.assertTrue(any(f[0] == "상대 탑 신지드" for f in factors))
+
+    def test_lane_opponent_prefers_lolalytics(self):
+        _, factors, _ = self.p.score("mid", "MALZAHAR", {"mid": "TALON"}, {})
+        lane = [f for f in factors if f[0].startswith("맞라인")]
+        self.assertEqual(len(lane), 1)              # OP.GG 값과 중복 반영하지 않음
+        self.assertIn("LoLalytics", lane[0][3])
+        self.assertGreater(lane[0][1], 0)           # 55% 전적 → 유리
+
+    def test_centering_removes_global_bias(self):
+        # 모든 상대에게 똑같이 +5%p 높게 나오는 목록이면 상호작용은 0이어야 한다
+        p = self.p
+        p.lola["mid"]["MALZAHAR"]["vs"]["adc"] = [[6, 55.0, 1000, 50.0]]
+        _, factors, _ = p.score("mid", "MALZAHAR", {"adc": "KAISA"}, {})
+        f = [x for x in factors if x[0].startswith("상대 원딜")][0]
+        self.assertAlmostEqual(f[1], 0.0, places=6)
+
+    def test_missing_enemy_is_reported(self):
+        _, _, notes = self.p.score("mid", "MALZAHAR", {"jungle": "WUKONG"}, {})
+        self.assertTrue(any("오공" in n for n in notes))
 
 
 if __name__ == "__main__":
